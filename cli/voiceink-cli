@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Constants ────────────────────────────────────────────────────────────────
+VOICEINK_MODELS_DIR="${VOICEINK_MODELS_DIR:-$HOME/Library/Application Support/com.prakashjoshipax.VoiceInk/WhisperModels}"
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+FORMAT="txt"
+OUTPUT=""
+MODEL=""
+WHISPER_LANG="auto"
+INPUT_FILE=""
+MIC_MODE=false
+PIPE_MODE=false
+
+# ── Temp file cleanup ─────────────────────────────────────────────────────────
+TEMP_PREFIX=""
+cleanup() {
+    if [[ -n "$TEMP_PREFIX" ]]; then
+        rm -f "$TEMP_PREFIX" "${TEMP_PREFIX}.wav" "${TEMP_PREFIX}.txt"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat >&2 <<'EOF'
+Usage: voiceink-cli [FILE] [OPTIONS]
+
+  FILE              Audio file to transcribe. Omit to record from mic. Use - for stdin.
+
+Options:
+  --format  txt|md|json   Output format (default: txt)
+  --output  FILE          Write output to file instead of stdout
+  --model   MODEL_NAME    Whisper model to use (without .bin; default: largest available)
+  --lang    LANG          Language code or auto (default: auto)
+  --list-models           List available VoiceInk models and exit
+  -h, --help              Show this help
+
+Examples:
+  voiceink-cli meeting.m4a
+  voiceink-cli meeting.m4a --format md --output ~/notes/meeting.md
+  voiceink-cli meeting.m4a --format json
+  voiceink-cli                              # record from mic, Ctrl+C to stop
+  ffmpeg -i podcast.mp3 -f wav - | voiceink-cli --format json
+  voiceink-cli --list-models
+EOF
+    exit "${1:-1}"
+}
+
+# ── Argument parser ───────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format)
+                [[ $# -ge 2 ]] || { echo "Missing value for --format" >&2; usage; }
+                FORMAT="$2"; shift 2 ;;
+            --output)
+                [[ $# -ge 2 ]] || { echo "Missing value for --output" >&2; usage; }
+                OUTPUT="$2"; shift 2 ;;
+            --model)
+                [[ $# -ge 2 ]] || { echo "Missing value for --model" >&2; usage; }
+                MODEL="$2"; shift 2 ;;
+            --lang)
+                [[ $# -ge 2 ]] || { echo "Missing value for --lang" >&2; usage; }
+                WHISPER_LANG="$2"; shift 2 ;;
+            --list-models) list_models; exit 0 ;;
+            -h|--help)  usage 0 ;;
+            --)         shift; break ;;
+            -)
+                if [[ -z "$INPUT_FILE" ]]; then
+                    INPUT_FILE="-"
+                else
+                    echo "Unexpected argument: $1" >&2; usage
+                fi
+                shift ;;
+            -*) echo "Unknown flag: $1" >&2; usage ;;
+            *)
+                if [[ -z "$INPUT_FILE" ]]; then
+                    INPUT_FILE="$1"
+                else
+                    echo "Unexpected argument: $1" >&2; usage
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ "$INPUT_FILE" == "-" ]]; then
+        PIPE_MODE=true
+        INPUT_FILE=""
+    elif [[ -z "$INPUT_FILE" ]]; then
+        MIC_MODE=true
+    fi
+
+    # Validate format early to fail fast before expensive transcription
+    case "$FORMAT" in
+        txt|md|json) ;;
+        *) echo "Unknown format: $FORMAT  (use txt, md, or json)" >&2; exit 1 ;;
+    esac
+}
+
+list_models() {
+    if [[ ! -d "$VOICEINK_MODELS_DIR" ]]; then
+        echo "VoiceInk models directory not found:" >&2
+        echo "  $VOICEINK_MODELS_DIR" >&2
+        echo "Open VoiceInk and download a model first." >&2
+        exit 1
+    fi
+    local found=false
+    while IFS= read -r -d '' f; do
+        found=true
+        local name size
+        name=$(basename "$f" .bin)
+        size=$(du -h "$f" | cut -f1)
+        echo "  $name  ($size)"
+    done < <(find "$VOICEINK_MODELS_DIR" -maxdepth 1 -name "ggml-*.bin" -print0 | sort -z)
+    if [[ "$found" == false ]]; then
+        echo "No models found. Open VoiceInk and download a model first." >&2
+        exit 1
+    fi
+}
+check_deps() {
+    local ok=true
+    if ! command -v whisper-cli &>/dev/null; then
+        echo "Missing: whisper-cli  →  brew install whisper-cpp" >&2
+        ok=false
+    fi
+    if ! command -v ffmpeg &>/dev/null; then
+        echo "Missing: ffmpeg  →  brew install ffmpeg" >&2
+        ok=false
+    fi
+    [[ "$ok" == true ]] || exit 1
+}
+resolve_model() {
+    if [[ ! -d "$VOICEINK_MODELS_DIR" ]]; then
+        echo "VoiceInk models directory not found: $VOICEINK_MODELS_DIR" >&2
+        echo "Open VoiceInk and download a model first." >&2
+        exit 1
+    fi
+
+    if [[ -n "$MODEL" ]]; then
+        local path="$VOICEINK_MODELS_DIR/${MODEL}.bin"
+        if [[ ! -f "$path" ]]; then
+            echo "Model not found: ${MODEL}.bin" >&2
+            echo "Available models:" >&2
+            list_models >&2
+            exit 1
+        fi
+        echo "$path"
+        return
+    fi
+
+    # Default: largest ggml-*.bin by file size (excludes coremldata.bin)
+    local best
+    best=$(find "$VOICEINK_MODELS_DIR" -maxdepth 1 -name "ggml-*.bin" -print0 \
+        | xargs -0 ls -S 2>/dev/null | head -1)
+    if [[ -z "$best" ]]; then
+        echo "No models found in: $VOICEINK_MODELS_DIR" >&2
+        echo "Open VoiceInk and download a model first." >&2
+        exit 1
+    fi
+    echo "$best"
+}
+# convert_audio INPUT_PATH → sets TEMP_PREFIX (global), writes ${TEMP_PREFIX}.wav
+# Must be called WITHOUT command substitution so TEMP_PREFIX propagates to the EXIT trap.
+convert_audio() {
+    local input="$1"
+    TEMP_PREFIX=$(mktemp /tmp/voiceink-XXXXXX)
+    local wav="${TEMP_PREFIX}.wav"
+    echo "Converting audio..." >&2
+    if ! ffmpeg -y -i "$input" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" -loglevel error 2>/dev/null; then
+        echo "ffmpeg failed to convert: $input" >&2
+        exit 1
+    fi
+}
+
+# convert_stdin → sets TEMP_PREFIX (global), writes ${TEMP_PREFIX}.wav from stdin pipe
+convert_stdin() {
+    TEMP_PREFIX=$(mktemp /tmp/voiceink-XXXXXX)
+    local wav="${TEMP_PREFIX}.wav"
+    echo "Reading audio from stdin..." >&2
+    if ! ffmpeg -y -i pipe:0 -ar 16000 -ac 1 -c:a pcm_s16le "$wav" -loglevel error 2>/dev/null; then
+        echo "ffmpeg failed to read stdin" >&2
+        exit 1
+    fi
+}
+
+record_mic() {
+    TEMP_PREFIX=$(mktemp /tmp/voiceink-XXXXXX)
+    local wav="${TEMP_PREFIX}.wav"
+    echo "Recording from microphone... Press Ctrl+C to stop." >&2
+
+    ffmpeg -f avfoundation -i ":0" \
+        -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
+        -loglevel error 2>/dev/null &
+    local ffmpeg_pid=$!
+
+    # Intercept INT: terminate ffmpeg gracefully (finalize WAV), don't delete files yet
+    trap "kill '$ffmpeg_pid' 2>/dev/null; wait '$ffmpeg_pid' 2>/dev/null; trap cleanup INT" INT
+
+    wait "$ffmpeg_pid" 2>/dev/null || true
+    trap cleanup INT  # restore for normal exit path
+
+    if [[ ! -s "$wav" ]]; then
+        echo "No audio recorded." >&2
+        exit 1
+    fi
+}
+
+# run_whisper WAV_FILE MODEL_PATH → echoes transcript text to stdout
+run_whisper() {
+    local wav="$1"
+    local model_path="$2"
+    local out_prefix="${TEMP_PREFIX}"
+
+    echo "Transcribing..." >&2
+    # stdout redirected to /dev/null: -np still echoes transcript to stdout;
+    # we read from the .txt file instead to avoid double output
+    whisper-cli \
+        -m "$model_path" \
+        -f "$wav" \
+        -l "$WHISPER_LANG" \
+        -otxt \
+        -nt \
+        -np \
+        -of "$out_prefix" \
+        >/dev/null 2>/dev/null
+
+    local txt="${out_prefix}.txt"
+    if [[ ! -f "$txt" ]]; then
+        echo "whisper-cli produced no output" >&2
+        exit 1
+    fi
+    # Trim leading/trailing whitespace and collapse internal newlines
+    local text
+    text=$(< "$txt" tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
+    echo "$text"
+}
+
+get_duration() {
+    local file="$1"
+    ffprobe -v quiet -show_entries format=duration \
+        -of csv=p=0 "$file" 2>/dev/null | cut -d. -f1
+}
+
+format_secs() {
+    local s="$1"
+    printf '%02d:%02d:%02d' $((s/3600)) $(((s%3600)/60)) $((s%60))
+}
+
+# write_output CONTENT [DEST] — writes to stdout if DEST empty, file otherwise
+write_output() {
+    local content="$1"
+    local dest="${2:-}"
+    if [[ -n "$dest" ]]; then
+        mkdir -p "$(dirname "$dest")"
+        printf '%s\n' "$content" > "$dest"
+        echo "Saved to: $dest" >&2
+    else
+        printf '%s\n' "$content"
+    fi
+}
+
+# output_result TEXT SOURCE DURATION_SECS MODEL_NAME
+output_result() {
+    local text="$1"
+    local source="$2"
+    local duration_s="$3"
+    local model_name="$4"
+
+    case "$FORMAT" in
+        txt)
+            write_output "$text" "$OUTPUT"
+            ;;
+
+        md)
+            local date_iso duration_fmt
+            date_iso=$(date -u +"%Y-%m-%dT%H:%M:%S")
+            duration_fmt=$(format_secs "$duration_s")
+            local content
+            content=$(printf '%s\n' \
+                "---" \
+                "date: $date_iso" \
+                "source: $source" \
+                "duration: $duration_fmt" \
+                "model: $model_name" \
+                "language: $WHISPER_LANG" \
+                "---" \
+                "" \
+                "$text")
+            write_output "$content" "$OUTPUT"
+            ;;
+
+        json)
+            if ! command -v python3 &>/dev/null; then
+                echo "Missing: python3 (required for --format json)  →  brew install python3" >&2
+                exit 1
+            fi
+            local date_iso
+            date_iso=$(date -u +"%Y-%m-%dT%H:%M:%S")
+            local content
+            content=$(python3 - "$text" "$source" "$date_iso" "$duration_s" "$model_name" "$WHISPER_LANG" <<'PYEOF'
+import sys, json
+text, source, date_iso, dur, model, lang = sys.argv[1:]
+obj = {
+    "text": text,
+    "source": source,
+    "date": date_iso,
+    "duration_seconds": int(dur) if dur.isdigit() else dur,
+    "model": model,
+    "language": lang,
+}
+print(json.dumps(obj, indent=2, ensure_ascii=False))
+PYEOF
+)
+            write_output "$content" "$OUTPUT"
+            ;;
+
+        *)
+            echo "Unknown format: $FORMAT  (use txt, md, or json)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+main() {
+    parse_args "$@"
+    check_deps
+
+    local model_path model_name
+    model_path=$(resolve_model)
+    model_name=$(basename "$model_path" .bin)
+    echo "Using model: $model_name" >&2
+
+    local source_name
+    if [[ "$MIC_MODE" == true ]]; then
+        record_mic
+        source_name="microphone"
+    elif [[ "$PIPE_MODE" == true ]]; then
+        convert_stdin
+        source_name="stdin"
+    else
+        convert_audio "$INPUT_FILE"
+        source_name=$(basename "$INPUT_FILE")
+    fi
+    local wav="${TEMP_PREFIX}.wav"
+
+    local text duration_s
+    text=$(run_whisper "$wav" "$model_path")
+    duration_s=$(get_duration "$wav")
+
+    output_result "$text" "$source_name" "$duration_s" "$model_name"
+}
+
+main "$@"
