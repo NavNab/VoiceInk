@@ -17,7 +17,7 @@ PIPE_MODE=false
 TEMP_PREFIX=""
 cleanup() {
     if [[ -n "$TEMP_PREFIX" ]]; then
-        rm -f "$TEMP_PREFIX" "${TEMP_PREFIX}.wav" "${TEMP_PREFIX}.txt"
+        rm -f "$TEMP_PREFIX" "${TEMP_PREFIX}.wav" "${TEMP_PREFIX}.txt" "${TEMP_PREFIX}.srt"
     fi
 }
 trap cleanup EXIT INT TERM
@@ -30,17 +30,18 @@ Usage: voiceink-cli [FILE] [OPTIONS]
   FILE              Audio file to transcribe. Omit to record from mic. Use - for stdin.
 
 Options:
-  --format  txt|md|json   Output format (default: txt)
-  --output  FILE          Write output to file instead of stdout
-  --model   MODEL_NAME    Whisper model to use (without .bin; default: largest available)
-  --lang    LANG          Language code or auto (default: auto)
-  --list-models           List available VoiceInk models and exit
-  -h, --help              Show this help
+  --format  txt|md|json|srt   Output format (default: txt)
+  --output  FILE              Write output to file instead of stdout
+  --model   MODEL_NAME        Whisper model to use (without .bin; default: largest available)
+  --lang    LANG              Language code or auto (default: auto)
+  --list-models               List available VoiceInk models and exit
+  -h, --help                  Show this help
 
 Examples:
   voiceink-cli meeting.m4a
   voiceink-cli meeting.m4a --format md --output ~/notes/meeting.md
   voiceink-cli meeting.m4a --format json
+  voiceink-cli meeting.m4a --format srt --output ~/notes/meeting.srt
   voiceink-cli                              # record from mic, Ctrl+C to stop
   ffmpeg -i podcast.mp3 -f wav - | voiceink-cli --format json
   voiceink-cli --list-models
@@ -94,8 +95,8 @@ parse_args() {
 
     # Validate format early to fail fast before expensive transcription
     case "$FORMAT" in
-        txt|md|json) ;;
-        *) echo "Unknown format: $FORMAT  (use txt, md, or json)" >&2; exit 1 ;;
+        txt|md|json|srt) ;;
+        *) echo "Unknown format: $FORMAT  (use txt, md, json, or srt)" >&2; exit 1 ;;
     esac
 }
 
@@ -207,34 +208,53 @@ record_mic() {
     fi
 }
 
-# run_whisper WAV_FILE MODEL_PATH → echoes transcript text to stdout
+# run_whisper WAV_FILE MODEL_PATH → echoes transcript to stdout
 run_whisper() {
     local wav="$1"
     local model_path="$2"
     local out_prefix="${TEMP_PREFIX}"
 
     echo "Transcribing..." >&2
-    # stdout redirected to /dev/null: -np still echoes transcript to stdout;
-    # we read from the .txt file instead to avoid double output
-    whisper-cli \
-        -m "$model_path" \
-        -f "$wav" \
-        -l "$WHISPER_LANG" \
-        -otxt \
-        -nt \
-        -np \
-        -of "$out_prefix" \
-        >/dev/null 2>/dev/null
 
-    local txt="${out_prefix}.txt"
-    if [[ ! -f "$txt" ]]; then
-        echo "whisper-cli produced no output" >&2
-        exit 1
+    if [[ "$FORMAT" == "srt" ]]; then
+        whisper-cli \
+            -m "$model_path" \
+            -f "$wav" \
+            -l "$WHISPER_LANG" \
+            -osrt \
+            -np \
+            -of "$out_prefix" \
+            >/dev/null 2>/dev/null
+
+        local srt="${out_prefix}.srt"
+        if [[ ! -f "$srt" ]]; then
+            echo "whisper-cli produced no output" >&2
+            exit 1
+        fi
+        cat "$srt"
+    else
+        # stdout redirected to /dev/null: -np still echoes transcript to stdout;
+        # we read from the .txt file instead to avoid double output
+        whisper-cli \
+            -m "$model_path" \
+            -f "$wav" \
+            -l "$WHISPER_LANG" \
+            -otxt \
+            -nt \
+            -np \
+            -of "$out_prefix" \
+            >/dev/null 2>/dev/null
+
+        local txt="${out_prefix}.txt"
+        if [[ ! -f "$txt" ]]; then
+            echo "whisper-cli produced no output" >&2
+            exit 1
+        fi
+        # Trim leading/trailing whitespace and collapse internal newlines
+        local text
+        text=$(< "$txt" tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
+        echo "$text"
     fi
-    # Trim leading/trailing whitespace and collapse internal newlines
-    local text
-    text=$(< "$txt" tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
-    echo "$text"
 }
 
 get_duration() {
@@ -316,8 +336,12 @@ PYEOF
             write_output "$content" "$OUTPUT"
             ;;
 
+        srt)
+            write_output "$text" "$OUTPUT"
+            ;;
+
         *)
-            echo "Unknown format: $FORMAT  (use txt, md, or json)" >&2
+            echo "Unknown format: $FORMAT  (use txt, md, json, or srt)" >&2
             exit 1
             ;;
     esac
