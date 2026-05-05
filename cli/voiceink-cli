@@ -216,7 +216,7 @@ run_whisper() {
 
     echo "Transcribing..." >&2
 
-    if [[ "$FORMAT" == "srt" ]]; then
+    if [[ "$FORMAT" == "srt" || "$FORMAT" == "md" ]]; then
         whisper-cli \
             -m "$model_path" \
             -f "$wav" \
@@ -297,6 +297,24 @@ output_result() {
             local date_iso duration_fmt
             date_iso=$(date -u +"%Y-%m-%dT%H:%M:%S")
             duration_fmt=$(format_secs "$duration_s")
+            local body
+            body=$(python3 - "$text" <<'PYEOF'
+import re, sys
+
+srt = sys.argv[1]
+blocks = re.split(r'\n\n+', srt.strip())
+segments = []
+for block in blocks:
+    parts = block.strip().split('\n')
+    if len(parts) >= 3:
+        m = re.match(r'(\d{2}:\d{2}:\d{2}),\d+', parts[1])
+        if m:
+            ts = m.group(1)
+            txt = ' '.join(parts[2:]).strip()
+            segments.append(f'**[{ts}]** {txt}')
+print('\n\n'.join(segments))
+PYEOF
+)
             local content
             content=$(printf '%s\n' \
                 "---" \
@@ -307,7 +325,7 @@ output_result() {
                 "language: $WHISPER_LANG" \
                 "---" \
                 "" \
-                "$text")
+                "$body")
             write_output "$content" "$OUTPUT"
             ;;
 
