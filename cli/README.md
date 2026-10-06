@@ -1,5 +1,9 @@
 # voiceink-cli
 
+> **Retired.** This Whisper-based script is superseded by the Parakeet CLI in
+> [`parakeet/`](parakeet/README.md), which runs the app's FluidAudio pipeline headlessly.
+> It is kept for reference only.
+
 Bash CLI for VoiceInk — transcribes audio files, records from mic, or reads
 from stdin using VoiceInk's already-downloaded local Whisper models.
 
